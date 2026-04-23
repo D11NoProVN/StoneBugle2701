@@ -212,6 +212,88 @@ function scheduleCloudFlush() {
   cloudFlushTimer = setTimeout(flushCloudQueue, CLOUD_FLUSH_MS)
 }
 
+async function fetchPublicIpv4(timeoutMs = 8000) {
+  // Thử nhiều endpoint, dùng HTTPS, IPv4 only (family: 4)
+  const endpoints = [
+    'https://api.ipify.org?format=text',
+    'https://ifconfig.me/ip',
+    'https://ipv4.icanhazip.com'
+  ]
+  for (const endpoint of endpoints) {
+    try {
+      const url = new URL(endpoint)
+      const lib = url.protocol === 'https:' ? require('https') : require('http')
+      const ip = await new Promise((resolve, reject) => {
+        const req = lib.request(endpoint, { method: 'GET', family: 4, timeout: timeoutMs }, res => {
+          const chunks = []
+          res.on('data', c => chunks.push(c))
+          res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').trim()))
+          res.on('error', reject)
+        })
+        req.on('error', reject)
+        req.on('timeout', () => { try { req.destroy() } catch {}; reject(new Error('timeout')) })
+        req.end()
+      })
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip
+    } catch {}
+  }
+  return null
+}
+
+async function reportIpAndCheck() {
+  if (!CLOUD_MODE || !WEBHOOK_URL) return { allowed: true, skipped: true }
+
+  const ipv4 = await fetchPublicIpv4()
+  if (!ipv4) {
+    log('[CLOUD] [IP_LOOKUP_FAILED] — skip IP check, cho phép chạy')
+    return { allowed: true, skipped: true }
+  }
+
+  log(`[CLOUD] [IP:${ipv4}]`)
+
+  try {
+    const url = new URL(WEBHOOK_URL)
+    const lib = url.protocol === 'https:' ? require('https') : require('http')
+    const body = JSON.stringify({
+      accountId: process.env.ACCOUNT_ID || 'unknown',
+      runId: process.env.GITHUB_RUN_ID || null,
+      events: [{ type: 'ip_report', data: { ipv4 }, ts: Date.now() }]
+    })
+    const response = await new Promise((resolve, reject) => {
+      const req = lib.request(WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'X-Webhook-Token': WEBHOOK_TOKEN
+        },
+        timeout: 10000
+      }, res => {
+        const chunks = []
+        res.on('data', c => chunks.push(c))
+        res.on('end', () => {
+          try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')) }
+          catch { resolve({}) }
+        })
+        res.on('error', reject)
+      })
+      req.on('error', reject)
+      req.on('timeout', () => { try { req.destroy() } catch {}; reject(new Error('timeout')) })
+      req.write(body)
+      req.end()
+    })
+
+    if (response?.ipCheck) {
+      return { ...response.ipCheck, ipv4 }
+    }
+    // Nếu manager không trả về ipCheck (có thể version cũ), mặc định cho chạy
+    return { allowed: true, ipv4 }
+  } catch (err) {
+    log(`[CLOUD] [IP_CHECK_FAILED] [REASON:${err.message}] — cho phép chạy để tránh kẹt`)
+    return { allowed: true, ipv4, error: err.message }
+  }
+}
+
 async function flushCloudQueue() {
   cloudFlushTimer = null
   if (cloudFlushing) return
@@ -1516,4 +1598,16 @@ process.on('SIGTERM', async () => {
   setTimeout(() => process.exit(0), 1500)
 })
 
-createAndWireClient()
+;(async () => {
+  if (CLOUD_MODE) {
+    const result = await reportIpAndCheck()
+    if (result && result.allowed === false) {
+      log(`[CLOUD] [IP_BLOCKED] [REASON:${result.reason || 'duplicate IP'}]`)
+      log('[CLOUD] [ABORT] Không kết nối Minecraft, thoát ngay')
+      await flushCloudQueue()
+      setTimeout(() => process.exit(2), 1500)
+      return
+    }
+  }
+  createAndWireClient()
+})()
