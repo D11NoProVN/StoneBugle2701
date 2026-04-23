@@ -9,9 +9,6 @@ on:
       secret_suffix:
         description: "Suffix của secret name (đã sanitize A-Z/0-9/_)"
         required: true
-      msa_cache_filename:
-        description: "Tên file cache MSA gốc (vd: 77b833_bed-cache.json)"
-        required: true
       webhook_url:
         description: "HTTPS endpoint của manager local (ngrok/cloudflare tunnel URL)"
         required: true
@@ -55,18 +52,34 @@ jobs:
       - name: Install dependencies
         run: npm install --omit=dev --no-audit --no-fund
 
-      - name: Restore MSA cache from secret
+      - name: Restore MSA cache bundle from secret
         env:
           MSA_CACHE_B64: ${{ secrets[format('MSA_CACHE_{0}', inputs.secret_suffix)] }}
+          ACCOUNT_ID: ${{ inputs.account_id }}
         run: |
           if [ -z "$MSA_CACHE_B64" ]; then
             echo "::error::Missing repo secret MSA_CACHE_${{ inputs.secret_suffix }}"
             exit 1
           fi
-          mkdir -p .auth-cache/${{ inputs.account_id }}
-          TARGET=".auth-cache/${{ inputs.account_id }}/${{ inputs.msa_cache_filename }}"
-          echo "$MSA_CACHE_B64" | base64 -d > "$TARGET"
-          echo "MSA cache restored to $TARGET ($(wc -c < "$TARGET") bytes)"
+          mkdir -p ".auth-cache/$ACCOUNT_ID"
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const zlib = require('zlib');
+            const b64 = process.env.MSA_CACHE_B64;
+            const gz = Buffer.from(b64, 'base64');
+            const json = zlib.gunzipSync(gz).toString('utf8');
+            const data = JSON.parse(json);
+            const dir = path.join('.auth-cache', process.env.ACCOUNT_ID);
+            let total = 0;
+            for (const [name, content] of Object.entries(data.files || {})) {
+              const fp = path.join(dir, name);
+              fs.writeFileSync(fp, content, 'utf8');
+              total += Buffer.byteLength(content);
+              console.log('  [' + Buffer.byteLength(content) + 'B] ' + fp);
+            }
+            console.log('Restored ' + Object.keys(data.files).length + ' cache files, total ' + total + ' bytes');
+          "
 
       - name: Run AFK Bot
         env:
@@ -93,7 +106,6 @@ jobs:
                 inputs: {
                   account_id: '${{ inputs.account_id }}',
                   secret_suffix: '${{ inputs.secret_suffix }}',
-                  msa_cache_filename: '${{ inputs.msa_cache_filename }}',
                   webhook_url: '${{ inputs.webhook_url }}',
                   webhook_token: '${{ inputs.webhook_token }}',
                   areas: '${{ inputs.areas }}',
