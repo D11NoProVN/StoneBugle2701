@@ -1486,7 +1486,13 @@ function createAndWireClient() {
     if (name === 'text') {
       const rawMessage = params.message || ''
       const cleanMessage = stripMcColorCodes(rawMessage)
-      log(`[CHAT] [${String(params.source_name || 'System').toUpperCase()}] ${cleanMessage}`)
+      const sourceName = String(params.source_name || 'System').toUpperCase()
+      // Ẩn log chat của player khác (donutsmp rebroadcast qua SYSTEM type,
+      // dạng "<player>: <msg>") — đỡ spam terminal khi đông người.
+      const isPlayerChatterSpam = sourceName === 'SYSTEM' && /^[+\-*!]?[A-Za-z0-9_.]{2,20}:\s/.test(cleanMessage)
+      if (!isPlayerChatterSpam) {
+        log(`[CHAT] [${sourceName}] ${cleanMessage}`)
+      }
 
       if (!state.afkSuccess && state.waitingForAutoAssign) {
         const autoAssignedArea = detectAutoAssignedAfkArea(cleanMessage)
