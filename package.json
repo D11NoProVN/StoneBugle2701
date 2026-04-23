@@ -1,0 +1,16 @@
+{
+  "name": "afk-bot-runner",
+  "version": "1.0.0",
+  "description": "DonutSMP AFK bot runner designed for GitHub Actions cloud execution",
+  "private": true,
+  "main": "afk-worker.js",
+  "scripts": {
+    "start": "node afk-worker.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bedrock-protocol": "^3.44.0"
+  }
+}

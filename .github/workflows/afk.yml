@@ -1,0 +1,99 @@
+name: AFK Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      account_id:
+        description: "Account ID (khớp với secret MSA_CACHE_<id>)"
+        required: true
+      webhook_url:
+        description: "HTTPS endpoint của manager local (ngrok/cloudflare tunnel URL)"
+        required: true
+      webhook_token:
+        description: "Token xác thực webhook"
+        required: true
+      areas:
+        description: "Danh sách AFK area cách nhau dấu phẩy (trống = random 10-70)"
+        required: false
+        default: ""
+      run_duration_sec:
+        description: "Bot tự exit sau bao nhiêu giây (default 5h40m)"
+        required: false
+        default: "20400"
+      chain:
+        description: "Tự trigger job kế tiếp khi hết giờ (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: afk-${{ inputs.account_id }}
+  cancel-in-progress: false
+
+jobs:
+  afk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # 5h55m, để lại ~5 phút cho chain step
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Restore MSA cache from secret
+        env:
+          MSA_CACHE_B64: ${{ secrets[format('MSA_CACHE_{0}', inputs.account_id)] }}
+        run: |
+          if [ -z "$MSA_CACHE_B64" ]; then
+            echo "::error::Missing repo secret MSA_CACHE_${{ inputs.account_id }}"
+            exit 1
+          fi
+          mkdir -p .auth-cache/${{ inputs.account_id }}
+          echo "$MSA_CACHE_B64" | base64 -d > .auth-cache/${{ inputs.account_id }}/bed-cache.json
+          echo "MSA cache restored ($(wc -c < .auth-cache/${{ inputs.account_id }}/bed-cache.json) bytes)"
+
+      - name: Run AFK Bot
+        env:
+          CLOUD_MODE: "true"
+          IS_WORKER: "false"
+          ACCOUNT_ID: ${{ inputs.account_id }}
+          WEBHOOK_URL: ${{ inputs.webhook_url }}
+          WEBHOOK_TOKEN: ${{ inputs.webhook_token }}
+          AFK_AREAS: ${{ inputs.areas }}
+          RUN_DURATION_SEC: ${{ inputs.run_duration_sec }}
+        run: node afk-worker.js
+
+      - name: Trigger chain (self-restart)
+        if: always() && inputs.chain == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'afk.yml',
+                ref: context.ref,
+                inputs: {
+                  account_id: '${{ inputs.account_id }}',
+                  webhook_url: '${{ inputs.webhook_url }}',
+                  webhook_token: '${{ inputs.webhook_token }}',
+                  areas: '${{ inputs.areas }}',
+                  run_duration_sec: '${{ inputs.run_duration_sec }}',
+                  chain: 'true'
+                }
+              })
+              core.info('Chain dispatch scheduled successfully')
+            } catch (err) {
+              core.warning('Chain dispatch failed: ' + err.message)
+            }

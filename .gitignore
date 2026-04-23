@@ -1,0 +1,7 @@
+node_modules/
+.auth-cache/
+data/
+logs/
+*.log
+afk_snapshot.json
+.env
