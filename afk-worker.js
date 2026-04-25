@@ -31,6 +31,8 @@ const AFK_AUTH_INPUT_MS = Math.max(50, Number(process.env.AFK_AUTH_INPUT_MS || 5
 const AFK_AUTH_INPUT_LOG_EVERY = Math.max(1, Number(process.env.AFK_AUTH_INPUT_LOG_EVERY || 1200))
 const AFK_MOVEMENT_PACKET_MODE = String(process.env.AFK_MOVEMENT_PACKET_MODE || 'auth').toLowerCase()
 const AFK_TICK_SYNC_EVERY = Math.max(1, Number(process.env.AFK_TICK_SYNC_EVERY || 10))
+const AFK_LOOK_JITTER_DEGREES = Math.max(0, Number(process.env.AFK_LOOK_JITTER_DEGREES || 1.25))
+const AFK_LOOK_JITTER_PERIOD_TICKS = Math.max(20, Number(process.env.AFK_LOOK_JITTER_PERIOD_TICKS || 240))
 const AFK_ANCHOR_CAPTURE_DELAY_MS = 2000
 const AFK_DRIFT_CHECK_MS = 15000
 const AFK_DRIFT_DISTANCE = 24
@@ -448,6 +450,8 @@ const state = {
   pitch: 0,
   yaw: 0,
   headYaw: 0,
+  basePitch: 0,
+  baseYaw: 0,
   scoreboardEntryMap: new Map(),
   scoreboardObjectiveMap: new Map(),
   scoreboardEntries: [],
@@ -638,6 +642,8 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.pitch = 0
   state.yaw = 0
   state.headYaw = 0
+  state.basePitch = 0
+  state.baseYaw = 0
   state.scoreboardEntryMap = new Map()
   state.scoreboardObjectiveMap = new Map()
   state.scoreboardEntries = []
@@ -689,6 +695,26 @@ function updateRotation(params = {}) {
   else state.headYaw = state.yaw
 }
 
+function captureAfkLookBase() {
+  state.basePitch = Number.isFinite(Number(state.pitch)) ? Number(state.pitch) : 0
+  state.baseYaw = Number.isFinite(Number(state.yaw)) ? Number(state.yaw) : 0
+}
+
+function getHeartbeatLook() {
+  if (!AFK_LOOK_JITTER_DEGREES) {
+    return {
+      pitch: state.basePitch || state.pitch || 0,
+      yaw: state.baseYaw || state.yaw || 0,
+      headYaw: state.baseYaw || state.headYaw || state.yaw || 0
+    }
+  }
+
+  const phase = (Number(state.authInputPacketCount % AFK_LOOK_JITTER_PERIOD_TICKS) / AFK_LOOK_JITTER_PERIOD_TICKS) * Math.PI * 2
+  const yaw = (state.baseYaw || 0) + Math.sin(phase) * AFK_LOOK_JITTER_DEGREES
+  const pitch = (state.basePitch || 0) + Math.sin(phase / 2) * Math.min(AFK_LOOK_JITTER_DEGREES / 2, 0.75)
+  return { pitch, yaw, headYaw: yaw }
+}
+
 function blockPositionFromPosition(position) {
   return {
     x: Math.floor(Number(position?.x) || 0),
@@ -712,15 +738,16 @@ function shouldSendMovePlayer() {
 function buildAuthInputPacket() {
   const position = clonePosition(state.currentPosition)
   if (!position) return null
+  const look = getHeartbeatLook()
   const inputData = { received_server_data: true }
   if (state.pendingTeleportAckPackets > 0) inputData.handled_teleport = true
 
   return {
-    pitch: state.pitch || 0,
-    yaw: state.yaw || 0,
+    pitch: look.pitch,
+    yaw: look.yaw,
     position,
     move_vector: { x: 0, z: 0 },
-    head_yaw: state.headYaw || state.yaw || 0,
+    head_yaw: look.headYaw,
     input_data: inputData,
     input_mode: 'mouse',
     play_mode: 'normal',
@@ -737,12 +764,13 @@ function buildAuthInputPacket() {
 function buildMovePlayerPacket() {
   const position = clonePosition(state.currentPosition)
   if (!position || !state.client || state.client.entityId == null) return null
+  const look = getHeartbeatLook()
   return {
     runtime_id: Number(state.client.entityId),
     position,
-    pitch: state.pitch || 0,
-    yaw: state.yaw || 0,
-    head_yaw: state.headYaw || state.yaw || 0,
+    pitch: look.pitch,
+    yaw: look.yaw,
+    head_yaw: look.headYaw,
     mode: 'normal',
     on_ground: true,
     ridden_runtime_id: 0,
@@ -790,7 +818,8 @@ function sendAuthInputHeartbeat(reason = 'interval') {
     state.lastActivityAt = new Date().toISOString()
 
     if (process.env.AFK_DEBUG_INPUT === '1' || state.authInputPacketCount === 1 || state.authInputPacketCount % AFK_AUTH_INPUT_LOG_EVERY === 0) {
-      log(`[AFK] [INPUT_HEARTBEAT] [COUNT:${state.authInputPacketCount}] [TICK:${state.authInputTick}] [MODE:${AFK_MOVEMENT_PACKET_MODE}] [AUTHORITY:${state.movementAuthority || 'unknown'}] [POS:${formatPosition(state.currentPosition)}] [REASON:${reason}]`)
+      const look = getHeartbeatLook()
+      log(`[AFK] [INPUT_HEARTBEAT] [COUNT:${state.authInputPacketCount}] [TICK:${state.authInputTick}] [MODE:${AFK_MOVEMENT_PACKET_MODE}] [AUTHORITY:${state.movementAuthority || 'unknown'}] [POS:${formatPosition(state.currentPosition)}] [YAW:${look.yaw.toFixed(2)}] [REASON:${reason}]`)
     }
     return true
   } catch (err) {
@@ -1012,7 +1041,7 @@ function getScoreboardStats() {
   const localSeconds = getLocalPlaytimeSeconds()
   const serverSeconds = playtime?.seconds ?? null
 
-  // Ưu tiên server value (nếu parse được seconds), fallback sang local
+  // Server scoreboard can go stale; display the greater server/local value.
   const displaySeconds = Math.max(Number(serverSeconds) || 0, Number(localSeconds) || 0)
   const displayValue = formatDurationHuman(displaySeconds)
   const displaySource = (serverSeconds != null && serverSeconds >= localSeconds) ? 'server' : 'local'
@@ -1794,6 +1823,7 @@ function markAfkSuccess(reason) {
   state.successAt = new Date().toISOString()
   state.lastStatusAt = state.successAt
   log(`[AFK] [SUCCESS] [AFK:${state.currentTargetArea}] [REASON:${compactReason(reason, 36)}]`)
+  captureAfkLookBase()
   startAuthInputLoop('afk_success')
   scheduleAnchorCapture('afk_success')
   helper.saveSnapshot('afk_success', {
@@ -2322,7 +2352,8 @@ setInterval(() => {
   const current = state.currentTargetArea == null ? 'none' : state.currentTargetArea
   const status = state.afkSuccess ? 'SUCCESS' : (state.afkAttemptInFlight ? 'PENDING' : 'IDLE')
   const reconnectCount = state.reconnectAttempt || 0
-  log(`[HEARTBEAT] [${status}] [AFK:${current}] [POS:${formatPosition(state.currentPosition)}] [RECONNECT:${reconnectCount}]`)
+  const playtime = getScoreboardStats().playtime
+  log(`[HEARTBEAT] [${status}] [AFK:${current}] [POS:${formatPosition(state.currentPosition)}] [PLAYTIME:${playtime.value}] [SRC:${playtime.source}] [SERVER:${playtime.serverSeconds ?? '-'}] [LOCAL:${playtime.localSeconds ?? '-'}] [RECONNECT:${reconnectCount}]`)
 }, HEARTBEAT_MS)
 
 setInterval(() => {
