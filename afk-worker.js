@@ -23,7 +23,8 @@ const AFK_AUTO_ASSIGN_GRACE_MS = 6500
 const AFK_RESULT_TIMEOUT_MS = 8000
 const HEARTBEAT_MS = 30000
 const RECONNECT_DELAY_MS = 10000
-const RECONNECT_WATCHDOG_MS = 20000
+const RECONNECT_WATCHDOG_MS = Math.max(30000, Number(process.env.RECONNECT_WATCHDOG_MS || 90000))
+const CONNECT_TIMEOUT_MS = Math.max(15000, Number(process.env.CONNECT_TIMEOUT_MS || 60000))
 const ALREADY_LOGGED_IN_RECONNECT_DELAY_MS = 3000
 const ALREADY_LOGGED_IN_MAX_RETRIES = 3
 const AFK_ANTI_IDLE_MS = 45000
@@ -427,6 +428,8 @@ const state = {
   anchorTimeout: null,
   reconnectTimeout: null,
   reconnectWatchdogTimeout: null,
+  lastConnectProgressAt: null,
+  connectPhase: 'idle',
   reconnecting: false,
   reconnectAttempt: 0,
   alreadyLoggedInRetries: 0,
@@ -611,6 +614,33 @@ function clearReconnectWatchdogTimeout() {
   }
 }
 
+function markConnectProgress(phase) {
+  state.lastConnectProgressAt = Date.now()
+  state.connectPhase = phase
+}
+
+function scheduleReconnectWatchdog(client) {
+  clearReconnectWatchdogTimeout()
+  state.reconnectWatchdogTimeout = setTimeout(() => {
+    state.reconnectWatchdogTimeout = null
+    if (state.shuttingDown) return
+    if (state.client !== client) return
+    if (state.spawned) return
+
+    const lastProgressAt = state.lastConnectProgressAt || 0
+    const idleMs = Date.now() - lastProgressAt
+    if (idleMs < RECONNECT_WATCHDOG_MS) {
+      scheduleReconnectWatchdog(client)
+      return
+    }
+
+    log(`[RECONNECT] [WATCHDOG] [TIMEOUT:${Math.floor(RECONNECT_WATCHDOG_MS / 1000)}s] [PHASE:${state.connectPhase || 'unknown'}] [ACTION:CLOSE]`)
+    try {
+      client.close()
+    } catch {}
+  }, Math.min(RECONNECT_WATCHDOG_MS, 15000))
+}
+
 function clearAuthInputLoop() {
   if (state.authInputInterval) {
     clearInterval(state.authInputInterval)
@@ -634,6 +664,8 @@ function resetJoinState({ keepSuccess = false } = {}) {
   state.afkAnchorPosition = null
   state.afkAnchorCapturedAt = null
   state.lastActivityAt = null
+  state.lastConnectProgressAt = null
+  state.connectPhase = 'idle'
   state.authInputTick = 0n
   state.authInputPacketCount = 0
   state.authInputConsecutiveErrors = 0
@@ -2059,7 +2091,7 @@ function createAndWireClient() {
     profilesFolder: authCacheDir,
     offline: false,
     skipPing: true,
-    connectTimeout: 15000,
+    connectTimeout: CONNECT_TIMEOUT_MS,
     // Dùng jsp-raknet khi có proxy (để override UDP socket qua SOCKS5).
     // Không proxy -> dùng raknet-native (C++ binding, ổn định hơn, mặc định).
     raknetBackend: hasProxy ? 'jsp-raknet' : 'raknet-native',
@@ -2089,6 +2121,7 @@ function createAndWireClient() {
   }
 
   const client = bedrock.createClient(clientOptions)
+  markConnectProgress('client_created')
 
   // Safety net: gắn error listener ngay để tránh crash nếu error fire trước khi handler chính gắn
   // (hoặc sau khi client.close() gọi removeAllListeners)
@@ -2098,15 +2131,7 @@ function createAndWireClient() {
 
   state.client = client
   helper.setClient(client)
-  state.reconnectWatchdogTimeout = setTimeout(() => {
-    if (state.shuttingDown) return
-    if (state.client !== client) return
-    if (state.spawned) return
-    log(`[RECONNECT] [WATCHDOG] [TIMEOUT:${Math.floor(RECONNECT_WATCHDOG_MS / 1000)}s] [ACTION:CLOSE]`)
-    try {
-      client.close()
-    } catch {}
-  }, RECONNECT_WATCHDOG_MS)
+  scheduleReconnectWatchdog(client)
 
   const originalWrite = client.write
   client.write = function wrappedWrite(name, params) {
@@ -2117,15 +2142,18 @@ function createAndWireClient() {
   captureAccountIdentity(client)
 
   client.on('connect', () => {
+    markConnectProgress('connect')
     log('[EVENT] [CONNECT]')
   })
 
   client.on('join', () => {
+    markConnectProgress('join')
     captureAccountIdentity(client)
     log('[EVENT] [JOIN]')
   })
 
   client.on('spawn', () => {
+    markConnectProgress('spawn')
     log('[EVENT] [SPAWN]')
   })
 
@@ -2173,6 +2201,7 @@ function createAndWireClient() {
   client.on('packet', packet => {
     const name = packet.data.name
     const params = packet.data.params
+    if (!state.spawned) markConnectProgress(`packet:${name}`)
 
     if (name === 'network_stack_latency' && params.needs_response) {
       const signedTimestamp = BigInt.asIntN(64, params.timestamp)
@@ -2353,7 +2382,7 @@ setInterval(() => {
   const status = state.afkSuccess ? 'SUCCESS' : (state.afkAttemptInFlight ? 'PENDING' : 'IDLE')
   const reconnectCount = state.reconnectAttempt || 0
   const playtime = getScoreboardStats().playtime
-  log(`[HEARTBEAT] [${status}] [AFK:${current}] [POS:${formatPosition(state.currentPosition)}] [PLAYTIME:${playtime.value}] [SRC:${playtime.source}] [SERVER:${playtime.serverSeconds ?? '-'}] [LOCAL:${playtime.localSeconds ?? '-'}] [RECONNECT:${reconnectCount}]`)
+  log(`[HEARTBEAT] [${status}] [AFK:${current}] [POS:${formatPosition(state.currentPosition)}] [PLAYTIME:${playtime.value}] [SRC:${playtime.source}] [SERVER:${playtime.serverSeconds ?? '-'}] [LOCAL:${playtime.localSeconds ?? '-'}] [PHASE:${state.connectPhase || 'idle'}] [RECONNECT:${reconnectCount}]`)
 }, HEARTBEAT_MS)
 
 setInterval(() => {
